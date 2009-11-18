@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+
+# Copyright 2009 Lulu, Inc.    
+# 
+# Licensed under the Apache License, Version 2.0 (the "License"); you
+# may not use this file except in compliance with the License. You may
+# obtain a copy of the License at
+# 
+#         http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+import sys
+import time
+import socket
+from threading import Thread
+from thrift.transport import TTransport
+from thrift.transport import TSocket
+from thrift.protocol import TBinaryProtocol
+
+from ttypes import *
+
+class MTCaller(Thread):
+    def __init__(self, service, duration, rate, fetches, calls):
+        Thread.__init__(self)
+        self.calls = calls
+        self.duration = duration
+        self.rate = rate
+        self.fetches = fetches
+        self.stats = dict([(x[0], {'time': [], 'errors': 0, 'duration': 0.0}) for x in calls])
+        self.client = None
+        self.transport = None
+
+        self.__renew_transport()
+
+        return
+
+    def __renew_transport(self, max_tries = 5):
+        if self.client:
+            del self.client
+        if self.transport:
+            self.transport.close()
+            del self.transport
+
+        tries = 0
+        while tries < max_tries:
+            try:
+                socket = TSocket.TSocket(host, port)
+                self.transport = TTransport.TBufferedTransport(socket)
+                protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
+                self.client = service.Client(protocol)
+                self.transport.open()
+                return
+            except TTransport.TTransportException:
+                time.sleep(1)
+                tries += 1
+
+    def __del__(self):
+        self.transport.close()
+    
+    def make_call(self, cmd, args):
+        func = getattr(self.client, cmd)
+        try:
+            start = time.time()
+            func(*args)
+            calltime = time.time() - start
+        except (socket.error, TTransport.TTransportException), e:
+            self.__renew_transport()
+            self.stats[cmd]['errors'] += 1
+            return
+        except Exception, e:
+            print >> sys.stderr, e
+            self.stats[cmd]['errors'] += 1
+            return
+
+        self.stats[cmd]['time'].append(calltime)
+        return
+        
+    def run(self):
+        start = time.time()
+        ncalls = 0
+        duration = 0
+        keep_calling = True
+        while keep_calling:
+            for callspec in calls:
+                if (self.duration and duration >= self.duration):
+                    keep_calling = False
+                    break
+                if (self.fetches and ncalls >= self.fetches):
+                    keep_calling = False
+                    break
+                cmd = callspec[0]
+                args = callspec[1:]
+                self.make_call(cmd, args)
+                ncalls += 1
+                duration = time.time() - start
+                self.stats[cmd]['duration'] = duration
+                if self.rate and (ncalls/duration > self.rate):
+                    time.sleep(ncalls/self.rate - duration)
+    
+if len(sys.argv) <= 5 or sys.argv[1] == '--help' or '-h' not in sys.argv or '-s' not in sys.argv:
+    print ''
+    print 'Usage: ' + sys.argv[0] + ' -h host:port -s Service [-t num_threads] [-d duration (seconds)] [-c num_calls] [-r max_fetch_rate] command_file'
+    print ''
+    sys.exit(0)
+
+host = 'localhost'
+port = 9090
+service = ''
+num_threads = 1
+rate = 0
+duration = 0
+fetches = 0
+argi = 1
+
+while argi < len(sys.argv) -1:
+    if sys.argv[argi] == '-h':
+        parts = sys.argv[argi+1].split(':') 
+        host = parts[0]
+        port = int(parts[1])
+        argi += 2
+
+    if sys.argv[argi] == '-s':
+        service = sys.argv[argi+1]
+        if service not in sys.modules:
+            try:
+                __import__(service)
+            except ImportError:
+                print >> sys.stderr, "Couldn't load service %s " % service
+                sys.exit(255)
+        service = sys.modules[service]
+        argi += 2
+    
+    if sys.argv[argi] == '-t':
+        num_threads = int(sys.argv[argi+1])
+        argi += 2
+
+    if sys.argv[argi] == '-d':
+        duration = int(sys.argv[argi+1])
+        argi += 2
+
+    if sys.argv[argi] == '-c':
+        fetches = int(sys.argv[argi+1])/num_threads
+        argi += 2
+
+    if sys.argv[argi] == '-r':
+        rate = float(sys.argv[argi+1])/num_threads
+        argi+=2
+
+
+call_list = open(sys.argv[argi]).readlines()
+calls = [eval(str(x)) for x in call_list]
+
+callers = []
+for i in range(0, num_threads):
+    callers.append(MTCaller(service, duration, rate, fetches, calls))
+    
+for caller in callers:
+    caller.start()
+    
+stats = {}
+for caller in callers:
+    caller.join()
+    for k, v in caller.stats.iteritems():
+        if k not in stats:
+            stats[k] = {'time': [], 'errors': 0, 'duration': 0.0}
+        stats[k]['time'].extend(caller.stats[k]['time'])
+        stats[k]['errors'] += caller.stats[k]['errors']
+        stats[k]['duration'] += caller.stats[k]['duration']
+
+# Compute and print stats
+for k, v in stats.iteritems():
+    times = v['time']
+    errors = v['errors']
+    times.sort()
+    times.reverse()
+    fetches = len(times)
+    throughput = num_threads*fetches/v['duration'] if v['duration'] else 0
+    avg_time = 1000 * sum(times)/fetches if fetches else 0
+    min_time = 1000 * times[-1] if len(times) else 0
+    max_time = 1000 * times[0] if len(times) else 0
+    fifty_p    = 1000 * times[fetches/2] if len(times) else 0
+    ninety_p = 1000 * times[fetches/10] if len(times) else 0
+    print "%25s: %06d fetches (%4.2f/sec). %05d errors. %5.2f ms (avg). %5.2f ms (50th %%ile). %5.2f ms (90th %%ile). %5.2f ms (min). %5.2f ms (max)" \
+                 % (k, fetches, throughput, errors, avg_time, fifty_p, ninety_p, min_time, max_time)
