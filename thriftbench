@@ -25,12 +25,13 @@ from thrift.protocol import TBinaryProtocol
 from ttypes import *
 
 class MTCaller(Thread):
-    def __init__(self, service, duration, rate, fetches, calls):
+    def __init__(self, service, duration, rate, fetches, calls, timeout):
         Thread.__init__(self)
         self.calls = calls
         self.duration = duration
         self.rate = rate
         self.fetches = fetches
+        self.timeout = timeout
         self.stats = dict([(x[0], {'time': [], 'errors': 0, 'duration': 0.0}) for x in calls])
         self.client = None
         self.transport = None
@@ -50,6 +51,7 @@ class MTCaller(Thread):
         while tries < max_tries:
             try:
                 socket = TSocket.TSocket(host, port)
+                socket.setTimeout(self.timeout)
                 self.transport = TTransport.TBufferedTransport(socket)
                 protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
                 self.client = service.Client(protocol)
@@ -115,6 +117,7 @@ num_threads = 1
 rate = 0
 duration = 0
 fetches = 0
+timeout = 1000
 argi = 1
 
 while argi < len(sys.argv) -1:
@@ -151,13 +154,16 @@ while argi < len(sys.argv) -1:
         rate = float(sys.argv[argi+1])/num_threads
         argi+=2
 
+    if sys.argv[argi] == '-T':
+        timeout = int(sys.argv[argi+1])
+        argi += 2
 
 call_list = open(sys.argv[argi]).readlines()
 calls = [eval(str(x)) for x in call_list]
 
 callers = []
 for i in range(0, num_threads):
-    callers.append(MTCaller(service, duration, rate, fetches, calls))
+    callers.append(MTCaller(service, duration, rate, fetches, calls, timeout))
     
 for caller in callers:
     caller.start()
